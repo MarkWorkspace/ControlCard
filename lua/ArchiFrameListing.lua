@@ -4384,7 +4384,15 @@ function OnSaveListControlCard(outFile)
                 if ok_info and objinfo and objinfo.id then
                     id = objinfo.id
                 else
-                    log_warning("Ошибка или нет id для guid: " .. tostring(guid) .. " при objectinfo")
+                    -- fallback: try reading ID directly from object
+                    local opened = pcall(ac_objectopen, guid)
+                    if opened then
+                        id = ac_objectget("#id") or ""
+                        ac_objectclose()
+                    end
+                    if id == "" then
+                        log_warning("Ошибка или нет id для guid: " .. tostring(guid) .. " при objectinfo")
+                    end
                 end
 
                 local ok_layer, layer = pcall(GetLayerNameOfObj, guid)

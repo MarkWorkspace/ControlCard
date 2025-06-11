@@ -4334,16 +4334,16 @@ function OnSaveListControlCard(outFile)
     end
 
     -- ===================================================
-    -- === Запись в лист "Невидимки" ArchiFrameElement ===
+    -- === Запись в лист "Невидимки" и подготовка для "Проемы" ===
     -- ===================================================
-   local wsInv = book:get_sheet(1)  -- второй лист (индексация с 0)
+    local wsInv = book:get_sheet(1)  -- второй лист (индексация с 0)
     if not wsInv then
         af.RaiseError("Sheet 'Невидимки' not found in template!")
     end
 
     local nrow = 11 -- стартовая строка (12-я, индексация с 0)
     local n = 1
-   
+
     -- Собираем множество guid из основной таблицы
     local gTblPlanksSet = {}
     for _, guid in ipairs(gTblPlanks) do
@@ -4372,6 +4372,8 @@ function OnSaveListControlCard(outFile)
     end
 
     local selGuids = ac_environment("getsel") or {}
+    local guidsForOpenings = {}  -- Запоминаем те же детали для проёмов
+
     for _, guid in ipairs(selGuids) do
         if not gTblPlanksSet[guid] then
             -- Защищённый вызов af_request
@@ -4384,7 +4386,6 @@ function OnSaveListControlCard(outFile)
                 if ok_info and objinfo and objinfo.id then
                     id = objinfo.id
                 else
-                    -- fallback: try reading ID directly from object
                     local opened = pcall(ac_objectopen, guid)
                     if opened then
                         id = ac_objectget("#id") or ""
@@ -4434,7 +4435,7 @@ function OnSaveListControlCard(outFile)
                     areanet = string.format("%.2f", q.quant.areanet or 0)
                 end
 
-                -- === Вычисляем периметры ===
+                -- === Периметры ===
                 local ok_out, outline = pcall(af_request, "getpoly", {holes=0, givelist=1}, guid)
                 if ok_out and outline and outline.poly and #outline.poly > 0 then
                     local plen = PolyLength(outline.poly[1])
@@ -4463,11 +4464,142 @@ function OnSaveListControlCard(outFile)
                 af.LibxlMbsToCell(book, wsInv, nrow, 7, areanet)
                 af.LibxlMbsToCell(book, wsInv, nrow, 8, perimeter)
                 af.LibxlMbsToCell(book, wsInv, nrow, 9, perimeter_openings)
+
+                local layertype = ""
+                local elem = ac_elemget(guid)
+                
+                -- Получаем структуру композитного элемента (внутрь себя)
+                local ok_parent, parent = pcall(af_request, "elem_openparent", guid)
+                if ok_parent and parent and parent.tblelems then
+                    for _, lyr in ipairs(parent.tblelems) do
+                        if lyr.guid == guid then
+                            layertype = lyr.type or ""
+                            break
+                        end
+                    end
+                end
+                -- Запись кода слоя в колонку K (индекс 10)
+                af.LibxlMbsToCell(book, wsInv, nrow, 10, layertype)
+
                 nrow = nrow + 1
                 n = n + 1
+
+                -- Добавляем guid для обработки проёмов
+                table.insert(guidsForOpenings, guid)
             end
         end
     end
+
+-- ===================================================
+-- === Запись в лист "Проемы" ArchiFrameOpenings ===
+-- ===================================================
+local wsOpen = book:get_sheet(2)
+if not wsOpen then af.RaiseError("Sheet 'Проемы' not found in template!") end
+
+local openAgg = {}
+
+for _, guid in ipairs(guidsForOpenings) do
+    local ok_holes, holes = pcall(af_request, "getpoly", {holes=1, givelist=1}, guid)
+    if ok_holes and holes and holes.poly and #holes.poly > 0 then
+        local id = ""
+        local layertype = ""
+        local ok_info, objinfo = pcall(af_request, "objectinfo", guid)
+        if ok_info and objinfo and objinfo.id then
+            id = tostring(objinfo.id)
+        end
+
+        -- layertype через родителя (как в "невидимках")
+        local ok_parent, parent = pcall(af_request, "elem_openparent", guid)
+        if ok_parent and parent and parent.tblelems then
+            for _, lyr in ipairs(parent.tblelems) do
+                if lyr.guid == guid then
+                    layertype = lyr.type or ""
+                    break
+                end
+            end
+        end
+
+        for _, pts in ipairs(holes.poly) do
+            local minx, maxx, miny, maxy = nil, nil, nil, nil
+            for _, pt in ipairs(pts) do
+                if not minx or pt.x < minx then minx = pt.x end
+                if not maxx or pt.x > maxx then maxx = pt.x end
+                if not miny or pt.y < miny then miny = pt.y end
+                if not maxy or pt.y > maxy then maxy = pt.y end
+            end
+            local width  = minx and maxx and math.floor(math.abs(maxx-minx)*1000 + 0.5) or 0
+            local height = miny and maxy and math.floor(math.abs(maxy-miny)*1000 + 0.5) or 0
+
+            local function poly_area(pts)
+                local area = 0
+                local n = #pts
+                for j=1,n do
+                    local p1, p2 = pts[j], pts[(j % n)+1]
+                    area = area + ((p1.x or 0)*(p2.y or 0) - (p2.x or 0)*(p1.y or 0))
+                end
+                return math.abs(area/2)*1e6
+            end
+            local area = poly_area(pts) / 1e6
+            local perim = (function(pts)
+                local L = 0
+                local count = #pts
+                if count < 2 then return 0 end
+                for i = 1, count do
+                    local j = (i % count) + 1
+                    local dx = (pts[j].x or 0) - (pts[i].x or 0)
+                    local dy = (pts[j].y or 0) - (pts[i].y or 0)
+                    L = L + math.sqrt(dx*dx + dy*dy)
+                end
+                return L
+            end)(pts)
+
+            -- Ключ для агрегации
+            local key = table.concat({id, width, height, layertype}, "|")
+            local rec = openAgg[key]
+            if not rec then
+                rec = {
+                    id = id,
+                    width = width,
+                    height = height,
+                    layertype = layertype,
+                    qty = 0,
+                    area = 0,
+                    perim = 0
+                }
+                openAgg[key] = rec
+            end
+            rec.qty = rec.qty + 1
+            rec.area = rec.area + area
+            rec.perim = rec.perim + perim
+        end
+    end
+end
+
+-- Вывод на лист
+local row = 11
+local num = 1
+local sorted = {}
+for _, rec in pairs(openAgg) do table.insert(sorted, rec) end
+table.sort(sorted, function(a, b)
+    if a.id ~= b.id then return a.id < b.id end
+    if a.width ~= b.width then return a.width < b.width end
+    if a.height ~= b.height then return a.height < b.height end
+    return (a.layertype or "") < (b.layertype or "")
+end)
+
+for _, r in ipairs(sorted) do
+    af.LibxlNumToCell(book, wsOpen, row, 0, num)
+    af.LibxlMbsToCell(book, wsOpen, row, 1, r.id)
+    af.LibxlNumToCell(book, wsOpen, row, 2, r.height)
+    af.LibxlNumToCell(book, wsOpen, row, 3, r.width)
+    af.LibxlNumToCell(book, wsOpen, row, 4, r.qty)
+    af.LibxlMbsToCell(book, wsOpen, row, 5, string.format("%.2f", r.area))
+    af.LibxlMbsToCell(book, wsOpen, row, 6, string.format("%.2f", r.perim))
+    af.LibxlMbsToCell(book, wsOpen, row, 7, r.layertype or "")
+    row = row + 1
+    num = num + 1
+end
+
 
 
 -- Save and open

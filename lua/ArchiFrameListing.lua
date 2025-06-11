@@ -4501,13 +4501,24 @@ local openAgg = {}
 for _, guid in ipairs(guidsForOpenings) do
     local ok_holes, holes = pcall(af_request, "getpoly", {holes=1, givelist=1}, guid)
     if ok_holes and holes and holes.poly and #holes.poly > 0 then
-        local id = ""
+        
         local layertype = ""
+        local id = ""
+        local ok_info, objinfo = pcall(af_request, "objectinfo", guid)
+        if ok_info and objinfo and objinfo.id then
+            id = objinfo.id
+        else
+            local opened = pcall(ac_objectopen, guid)
+            if opened then
+                id = ac_objectget("#id") or ""
+                ac_objectclose()
+            end
         local ok_info, objinfo = pcall(af_request, "objectinfo", guid)
         if ok_info and objinfo and objinfo.id then
             id = tostring(objinfo.id)
         end
-
+    end
+      
         -- layertype через родителя (как в "невидимках")
         local ok_parent, parent = pcall(af_request, "elem_openparent", guid)
         if ok_parent and parent and parent.tblelems then
